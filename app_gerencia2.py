@@ -3,7 +3,6 @@ import pandas as pd
 import plotly.express as px
 import requests
 import warnings
-import gc  # Librería para limpiar la memoria RAM manualmente
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
@@ -23,10 +22,6 @@ st.markdown("""
 
 BASE_URL = 'https://dicos.cl/appcom/'
 
-# ==========================================
-# 1. SISTEMA DE EXTRACCIÓN (Modo Ultra-Ligero)
-# ==========================================
-# Forzamos a Pandas a usar la menor cantidad de bytes posibles por columna
 dtypes_optimos = {
     'numero': 'string',
     'tipo_doc': 'category',
@@ -40,82 +35,22 @@ dtypes_optimos = {
     'venta_neta_linea': 'float32'
 }
 
-@st.cache_data(ttl=604800, show_spinner="Abriendo Bóveda Histórica...")
-def cargar_historico():
-    dfs = []
-    for anio in range(2016, 2026): 
-        try:
-            # Solo leemos las columnas que realmente usamos para no gastar RAM
-            cols_necesarias = ['numero', 'tipo_doc', 'fecha', 'comuna', 'vendedor', 'patente', 'repartidor', 'sku', 'descripcion', 'cant', 'costo_unitario', 'venta_neta_linea']
-            df = pd.read_csv(f"{BASE_URL}maestro_{anio}.csv", dtype=dtypes_optimos, usecols=cols_necesarias)
-            dfs.append(df)
-        except Exception:
-            continue 
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
-@st.cache_data(show_spinner="Descargando datos 2026...")
-def cargar_actual():
+# ==========================================
+# 1. EXTRACCIÓN A DEMANDA (1 AÑO A LA VEZ)
+# ==========================================
+@st.cache_data(show_spinner=False)
+def cargar_datos_anio(anio):
     try:
+        filename = "actual_maestro.csv" if anio == 2026 else f"maestro_{anio}.csv"
         cols_necesarias = ['numero', 'tipo_doc', 'fecha', 'comuna', 'vendedor', 'patente', 'repartidor', 'sku', 'descripcion', 'cant', 'costo_unitario', 'venta_neta_linea']
-        return pd.read_csv(f"{BASE_URL}actual_maestro.csv", dtype=dtypes_optimos, usecols=cols_necesarias)
-    except Exception:
+        df = pd.read_csv(f"{BASE_URL}{filename}", dtype=dtypes_optimos, usecols=cols_necesarias)
+        return df
+    except Exception as e:
+        st.error(f"Error al cargar datos del {anio}: {e}")
         return pd.DataFrame()
 
-df_hist = cargar_historico()
-df_act = cargar_actual()
-
-if df_act.empty:
-    st.error("⚠️ No se encontró la tabla del año actual.")
-    st.stop()
-
 # ==========================================
-# 2. PROCESAMIENTO Y REGLAS DE NEGOCIO
-# ==========================================
-with st.spinner("🧠 Ensamblando datos y limpiando memoria..."):
-    # 1. Unimos la historia con el año actual
-    df_final = pd.concat([df_hist, df_act], ignore_index=True)
-    
-    # 2. TÉCNICA CLAVE: Borramos las tablas originales de la RAM para evitar el colapso
-    del df_hist
-    del df_act
-    gc.collect() 
-    
-    # Manejo de fechas optimizado (le decimos el formato exacto para que no gaste CPU adivinando)
-    df_final['fecha_dt'] = pd.to_datetime(df_final['fecha'], format='%Y-%m-%d', errors='coerce')
-    df_final.dropna(subset=['fecha_dt'], inplace=True)
-    df_final['año'] = df_final['fecha_dt'].dt.year
-    df_final['mes'] = df_final['fecha_dt'].dt.month
-    
-    # Limpieza del tipo de documento para evitar errores de espacios invisibles
-    df_final['tipo_doc'] = df_final['tipo_doc'].astype(str).str.strip().str.upper()
-    
-    # Asignación financiera (Directo de Sisgen)
-    df_final['neto'] = df_final['venta_neta_linea'].fillna(0)
-    df_final['costo_total'] = df_final['cant'].fillna(0) * df_final['costo_unitario'].fillna(0)
-    
-    # Reglas Tributarias de Sisgen
-    CODIGOS_NOTA_CREDITO = ['NE']  
-    CODIGOS_VENTA_INTERNA = ['OV'] 
-    CODIGOS_COMPRA = ['FC', 'CR']  
-    
-    # Filtro de exclusión
-    excluir = CODIGOS_VENTA_INTERNA + CODIGOS_COMPRA
-    df_final = df_final[~df_final['tipo_doc'].isin(excluir)]
-        
-    # Notas de Crédito restan
-    mask_nc = df_final['tipo_doc'].isin(CODIGOS_NOTA_CREDITO)
-    df_final.loc[mask_nc, 'neto'] = -df_final.loc[mask_nc, 'neto'].abs()
-    df_final.loc[mask_nc, 'costo_total'] = -df_final.loc[mask_nc, 'costo_total'].abs()
-    
-    df_final['margen'] = df_final['neto'] - df_final['costo_total']
-    
-    # Llenado de nulos
-    cols_texto = ['vendedor', 'comuna', 'descripcion', 'patente', 'repartidor']
-    for col in cols_texto:
-        df_final[col] = df_final[col].fillna('Sin Registro')
-
-# ==========================================
-# 3. INTERFAZ GERENCIAL
+# INTERFAZ Y CONTROLES (SE MUEVEN ARRIBA)
 # ==========================================
 st.title("📊 DICOS SpA - Panel de Dirección")
 
@@ -124,20 +59,60 @@ if st.sidebar.button("🔄 Sincronizar Datos Hoy", use_container_width=True):
     with st.spinner("Actualizando 2026 desde el servidor..."):
         try:
             requests.get(f"{BASE_URL}fabrica_datos_real.php?anio=2026", timeout=20)
-            cargar_actual.clear()
+            cargar_datos_anio.clear()
             st.rerun()
         except Exception as e:
             st.sidebar.error(f"Error de red al sincronizar: {e}")
 
 st.sidebar.divider()
 
-periodos = sorted(df_final['año'].unique())
-anio_sel = st.sidebar.selectbox("Año Principal", periodos, index=len(periodos)-1 if periodos else 0)
+# Menú de selección temporal (Invertido para ver el actual primero)
+anios_disponibles = list(range(2026, 2015, -1))
+anio_sel = st.sidebar.selectbox("Año Principal", anios_disponibles, index=0)
 mes_sel = st.sidebar.selectbox("Mes de Foco", list(range(1, 13)), index=datetime.now().month - 1)
 
-df_anio = df_final[df_final['año'] == anio_sel]
+# ==========================================
+# 2. PROCESAMIENTO (SOLO EL AÑO SELECCIONADO)
+# ==========================================
+with st.spinner(f"🧠 Procesando datos de {anio_sel}..."):
+    df_anio = cargar_datos_anio(anio_sel)
+    
+    if df_anio.empty:
+        st.warning(f"No hay datos registrados o no se ha generado el archivo para el año {anio_sel}.")
+        st.stop()
+        
+    df_anio['fecha_dt'] = pd.to_datetime(df_anio['fecha'], format='%Y-%m-%d', errors='coerce')
+    df_anio.dropna(subset=['fecha_dt'], inplace=True)
+    df_anio['mes'] = df_anio['fecha_dt'].dt.month
+    
+    df_anio['tipo_doc'] = df_anio['tipo_doc'].astype(str).str.strip().str.upper()
+    
+    df_anio['neto'] = df_anio['venta_neta_linea'].fillna(0)
+    df_anio['costo_total'] = df_anio['cant'].fillna(0) * df_anio['costo_unitario'].fillna(0)
+    
+    CODIGOS_NOTA_CREDITO = ['NE']  
+    CODIGOS_VENTA_INTERNA = ['OV'] 
+    CODIGOS_COMPRA = ['FC', 'CR']  
+    
+    excluir = CODIGOS_VENTA_INTERNA + CODIGOS_COMPRA
+    df_anio = df_anio[~df_anio['tipo_doc'].isin(excluir)]
+        
+    mask_nc = df_anio['tipo_doc'].isin(CODIGOS_NOTA_CREDITO)
+    df_anio.loc[mask_nc, 'neto'] = -df_anio.loc[mask_nc, 'neto'].abs()
+    df_anio.loc[mask_nc, 'costo_total'] = -df_anio.loc[mask_nc, 'costo_total'].abs()
+    
+    df_anio['margen'] = df_anio['neto'] - df_anio['costo_total']
+    
+    cols_texto = ['vendedor', 'comuna', 'descripcion', 'patente', 'repartidor']
+    for col in cols_texto:
+        df_anio[col] = df_anio[col].fillna('Sin Registro')
+
+# Filtramos el mes específico
 df_mes = df_anio[df_anio['mes'] == mes_sel]
 
+# ==========================================
+# 3. RENDERIZADO GERENCIAL
+# ==========================================
 venta_neta_anio = df_anio['neto'].sum()
 margen_anio = df_anio['margen'].sum()
 eficiencia_anio = (margen_anio / venta_neta_anio * 100) if venta_neta_anio > 0 else 0
@@ -163,7 +138,8 @@ with tabs[0]:
     if not df_mes.empty:
         df_mes['vendedor_lbl'] = 'Cód: ' + df_mes['vendedor'].astype(str)
         vend_stats = df_mes.groupby('vendedor_lbl', as_index=False)['neto'].sum().sort_values('neto', ascending=True)
-        st.plotly_chart(px.bar(vend_stats, x='neto', y='vendedor_lbl', orientation='h'), use_container_width=True)
+        # Se corrigió la alerta de deprecación de Plotly
+        st.plotly_chart(px.bar(vend_stats, x='neto', y='vendedor_lbl', orientation='h'), width='stretch')
 
 with tabs[1]:
     st.markdown("#### 🧠 Rentabilidad por Producto (Top 50)")
@@ -173,10 +149,10 @@ with tabs[1]:
         ).reset_index()
         prod_stats['%_Margen'] = (prod_stats['Utilidad'] / prod_stats['Venta'] * 100).fillna(0)
         prod_top = prod_stats.sort_values('Venta', ascending=False).head(50)
-        st.dataframe(prod_top.style.format({'Venta': '${:,.0f}', 'Costo': '${:,.0f}', 'Utilidad': '${:,.0f}', '%_Margen': '{:.1f}%'}), use_container_width=True, hide_index=True)
+        st.dataframe(prod_top.style.format({'Venta': '${:,.0f}', 'Costo': '${:,.0f}', 'Utilidad': '${:,.0f}', '%_Margen': '{:.1f}%'}), hide_index=True)
 
 with tabs[2]:
     st.markdown("#### 📍 Penetración por Comuna")
     if not df_mes.empty:
         zona_stats = df_mes.groupby('comuna', as_index=False)['neto'].sum()
-        st.plotly_chart(px.pie(zona_stats[zona_stats['neto']>0], values='neto', names='comuna', hole=0.4), use_container_width=True)
+        st.plotly_chart(px.pie(zona_stats[zona_stats['neto']>0], values='neto', names='comuna', hole=0.4), width='stretch')
