@@ -57,19 +57,15 @@ if df_prod.empty:
 # ==========================================
 # 3. ENSAMBLAJE Y MATEMÁTICA ESTRICTA
 # ==========================================
-with st.spinner("🧠 Ensamblando Data Warehouse (Blindaje Cartesiano)..."):
+with st.spinner("🧠 Ensamblando Data Warehouse y Reglas de Negocio..."):
     df_cab_full = pd.concat([df_cab_hist, df_cab_act], ignore_index=True)
     df_det_full = pd.concat([df_det_hist, df_det_act], ignore_index=True)
-    
-    # Estandarizar nombre de columna de fecha para un JOIN seguro
-    df_det_full.rename(columns={'FECDOCU': 'fecha'}, inplace=True)
     
     # CRUCE 1: Detalle + Producto
     df_temp = pd.merge(df_det_full, df_prod, left_on='sku', right_on='PRCODIGO', how='inner')
     
     # CRUCE 2: Cabecera + (Detalle+Producto)
-    # EL CANDADO: Usamos Número, Tipo Y FECHA para no mezclar años
-    df_final = pd.merge(df_cab_full, df_temp, on=['FANUMERO', 'FATDOCTO', 'fecha'], how='inner')
+    df_final = pd.merge(df_cab_full, df_temp, left_on=['FANUMERO', 'FATDOCTO'], right_on=['DENUMFAC', 'DETDOCTO'], how='inner')
     
     # Formateo de Fechas
     df_final['fecha_dt'] = pd.to_datetime(df_final['fecha'], errors='coerce')
@@ -77,27 +73,38 @@ with st.spinner("🧠 Ensamblando Data Warehouse (Blindaje Cartesiano)..."):
     df_final['año'] = df_final['fecha_dt'].dt.year
     df_final['mes'] = df_final['fecha_dt'].dt.month
     
-    # Cálculos Base
+    # Cálculos Base (Conversión a números)
     cols_num = ['cant', 'PREC1', 'PRECOM']
     df_final[cols_num] = df_final[cols_num].apply(pd.to_numeric, errors='coerce').fillna(0)
     
+    # Cálculo de la Venta Neta (Sin impuestos)
     df_final['neto'] = df_final['cant'] * df_final['PREC1']
     df_final['costo'] = df_final['cant'] * df_final['PRECOM']
     
-    # APLICACIÓN DE REGLAS DE NEGOCIO (Notas de Crédito y Filtros)
-    # Excluir Ventas Internas
-    if CODIGOS_VENTA_INTERNA:
-        df_final = df_final[~df_final['FATDOCTO'].isin(CODIGOS_VENTA_INTERNA)]
+    # ---------------------------------------------------------
+    # APLICACIÓN DE REGLAS DE NEGOCIO (DICCIONARIO SISGEN)
+    # ---------------------------------------------------------
+    # 1. Limpieza extrema del tipo de documento para evitar errores por espacios invisibles
+    df_final['FATDOCTO'] = df_final['FATDOCTO'].astype(str).str.strip().str.upper()
+    
+    # 2. Diccionario de Códigos
+    CODIGOS_NOTA_CREDITO = ['NE']  # Nota de crédito de venta (DEBE RESTAR)
+    CODIGOS_VENTA_INTERNA = ['OV'] # Otras ventas (NO ES VENTA REAL)
+    CODIGOS_COMPRA = ['FC', 'CR']  # Compras (EXCLUIR DEL DASHBOARD DE VENTAS)
+    
+    # 3. Filtrar la "Basura": Excluir ventas internas y facturas de compra del panel comercial
+    excluir = CODIGOS_VENTA_INTERNA + CODIGOS_COMPRA
+    df_final = df_final[~df_final['FATDOCTO'].isin(excluir)]
         
-    # Convertir a negativo las Notas de Crédito
+    # 4. Matemáticas de Reversa: Convertir Notas de Crédito a valor negativo
     mask_nc = df_final['FATDOCTO'].isin(CODIGOS_NOTA_CREDITO)
     df_final.loc[mask_nc, 'neto'] = -df_final.loc[mask_nc, 'neto'].abs()
     df_final.loc[mask_nc, 'costo'] = -df_final.loc[mask_nc, 'costo'].abs()
     
-    # Margen final
+    # 5. Margen final real
     df_final['margen'] = df_final['neto'] - df_final['costo']
     
-    # Limpieza visual
+    # Limpieza visual para los gráficos
     for col in ['vendedor', 'comuna', 'descripcion']:
         df_final[col] = df_final[col].fillna('Sin Registro').astype(str)
 
