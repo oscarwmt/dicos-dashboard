@@ -7,6 +7,9 @@ from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
+# ==========================================
+# CONFIGURACIÓN GENERAL
+# ==========================================
 st.set_page_config(page_title="DICOS BI - Dirección", page_icon="📊", layout="wide")
 
 st.markdown("""
@@ -19,52 +22,43 @@ st.markdown("""
 
 BASE_URL = 'https://dicos.cl/appcom/'
 
-# Optimizador de Memoria: Categorizamos para no saturar la RAM e incluimos la Logística
-dtypes_optimos = {
-    'tipo_doc': 'category',
-    'comuna': 'category',
-    'vendedor': 'category',
-    'patente': 'category',       # NUEVO CAMPO LOGÍSTICO
-    'repartidor': 'category',    # NUEVO CAMPO LOGÍSTICO
-    'cant': 'float32',
-    'costo_unitario': 'float32',
-    'venta_neta_linea': 'float32'
-}
-
 # ==========================================
-# SISTEMA DE EXTRACCIÓN (Micro-Lotes Anuales)
+# 1. SISTEMA DE EXTRACCIÓN (Modo Diagnóstico)
 # ==========================================
+# Se ha retirado temporalmente el dtype estricto en la lectura para evitar bloqueos por formatos extraños en la base de datos.
 @st.cache_data(ttl=604800, show_spinner="Abriendo Bóveda Histórica...")
 def cargar_historico():
     dfs = []
-    # Busca dinámicamente los archivos generados año a año por el PHP
     for anio in range(2016, 2026): 
         try:
-            df = pd.read_csv(f"{BASE_URL}maestro_{anio}.csv", dtype=dtypes_optimos)
+            df = pd.read_csv(f"{BASE_URL}maestro_{anio}.csv", low_memory=False)
             dfs.append(df)
-        except Exception:
-            continue # Si un año no se ha generado en el servidor, simplemente lo salta
+        except Exception as e:
+            st.warning(f"Aviso: No se pudo leer maestro_{anio}.csv. Detalle: {e}")
+            continue 
     
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 @st.cache_data(show_spinner="Descargando datos del año en curso...")
 def cargar_actual():
     try:
-        return pd.read_csv(f"{BASE_URL}actual_maestro.csv", dtype=dtypes_optimos)
-    except Exception:
+        return pd.read_csv(f"{BASE_URL}actual_maestro.csv", low_memory=False)
+    except Exception as e:
+        # AQUÍ ESTÁ EL DETECTOR: Si falla, el error real aparecerá en una caja roja
+        st.error(f"🚨 Error real al leer actual_maestro.csv: {e}")
         return pd.DataFrame()
 
 df_hist = cargar_historico()
 df_act = cargar_actual()
 
 if df_act.empty:
-    st.error("⚠️ No se encontró el archivo del año en curso. Ejecuta el PHP en tu servidor primero.")
+    st.warning("⚠️ La tabla del año actual (2026) está vacía o falló su lectura. Revisa el error rojo de arriba.")
     st.stop()
 
 # ==========================================
-# PROCESAMIENTO ULTRALIGERO
+# 2. PROCESAMIENTO Y REGLAS DE NEGOCIO
 # ==========================================
-with st.spinner("🧠 Aplicando Reglas de Negocio..."):
+with st.spinner("🧠 Procesando Reglas de Negocio..."):
     df_final = pd.concat([df_hist, df_act], ignore_index=True)
     
     # Manejo de fechas
@@ -73,34 +67,43 @@ with st.spinner("🧠 Aplicando Reglas de Negocio..."):
     df_final['año'] = df_final['fecha_dt'].dt.year
     df_final['mes'] = df_final['fecha_dt'].dt.month
     
-    # Asignación financiera directa desde la tabla original
+    # Conversión segura a números para evitar errores de tipo en operaciones matemáticas
+    cols_num = ['cant', 'costo_unitario', 'venta_neta_linea']
+    for col in cols_num:
+        if col in df_final.columns:
+            df_final[col] = pd.to_numeric(df_final[col], errors='coerce').fillna(0)
+    
+    # Asignación financiera directa desde la tabla original de Sisgen
     df_final['neto'] = df_final['venta_neta_linea']
     df_final['costo_total'] = df_final['cant'] * df_final['costo_unitario']
     
     # Limpieza estricta de strings
     df_final['tipo_doc'] = df_final['tipo_doc'].astype(str).str.strip().str.upper()
     
-    # Reglas Tributarias
+    # Reglas Tributarias de Sisgen
     CODIGOS_NOTA_CREDITO = ['NE']  
     CODIGOS_VENTA_INTERNA = ['OV'] 
     CODIGOS_COMPRA = ['FC', 'CR']  
     
+    # Excluir documentos que no son ventas reales
     excluir = CODIGOS_VENTA_INTERNA + CODIGOS_COMPRA
     df_final = df_final[~df_final['tipo_doc'].isin(excluir)]
         
+    # Las Notas de Crédito deben restar (negativo)
     mask_nc = df_final['tipo_doc'].isin(CODIGOS_NOTA_CREDITO)
     df_final.loc[mask_nc, 'neto'] = -df_final.loc[mask_nc, 'neto'].abs()
     df_final.loc[mask_nc, 'costo_total'] = -df_final.loc[mask_nc, 'costo_total'].abs()
     
     df_final['margen'] = df_final['neto'] - df_final['costo_total']
     
-    # Blindaje contra nulos, incluyendo ahora la patente y el repartidor
+    # Blindaje contra nulos y optimización de memoria RAM
     for col in ['vendedor', 'comuna', 'descripcion', 'patente', 'repartidor']:
         if col in df_final.columns:
             df_final[col] = df_final[col].fillna('Sin Registro').astype(str)
+            df_final[col] = df_final[col].astype('category') # Recuperamos RAM aquí
 
 # ==========================================
-# INTERFAZ GERENCIAL
+# 3. INTERFAZ GERENCIAL
 # ==========================================
 st.title("📊 DICOS SpA - Panel de Dirección")
 
@@ -108,12 +111,11 @@ st.sidebar.markdown("### ⚙️ Centro de Datos")
 if st.sidebar.button("🔄 Sincronizar Datos Hoy", use_container_width=True):
     with st.spinner("Actualizando 2026 desde el servidor..."):
         try:
-            # Enrutamiento actualizado hacia la fábrica por año
             requests.get(f"{BASE_URL}fabrica_datos_real.php?anio=2026", timeout=20)
-            cargar_actual.clear()
+            cargar_actual.clear() # Borra la caché para forzar la recarga
             st.rerun()
         except Exception as e:
-            st.sidebar.error(f"Error de red: {e}")
+            st.sidebar.error(f"Error de red al sincronizar: {e}")
 
 st.sidebar.divider()
 
