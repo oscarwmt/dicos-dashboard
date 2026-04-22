@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import warnings
+import gc  # Librería para limpiar la memoria RAM manualmente
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
@@ -23,84 +24,95 @@ st.markdown("""
 BASE_URL = 'https://dicos.cl/appcom/'
 
 # ==========================================
-# 1. SISTEMA DE EXTRACCIÓN (Modo Diagnóstico)
+# 1. SISTEMA DE EXTRACCIÓN (Modo Ultra-Ligero)
 # ==========================================
-# Se ha retirado temporalmente el dtype estricto en la lectura para evitar bloqueos por formatos extraños en la base de datos.
+# Forzamos a Pandas a usar la menor cantidad de bytes posibles por columna
+dtypes_optimos = {
+    'numero': 'string',
+    'tipo_doc': 'category',
+    'comuna': 'category',
+    'vendedor': 'category',
+    'patente': 'category',
+    'repartidor': 'category',
+    'sku': 'string',
+    'cant': 'float32',
+    'costo_unitario': 'float32',
+    'venta_neta_linea': 'float32'
+}
+
 @st.cache_data(ttl=604800, show_spinner="Abriendo Bóveda Histórica...")
 def cargar_historico():
     dfs = []
     for anio in range(2016, 2026): 
         try:
-            df = pd.read_csv(f"{BASE_URL}maestro_{anio}.csv", low_memory=False)
+            # Solo leemos las columnas que realmente usamos para no gastar RAM
+            cols_necesarias = ['numero', 'tipo_doc', 'fecha', 'comuna', 'vendedor', 'patente', 'repartidor', 'sku', 'descripcion', 'cant', 'costo_unitario', 'venta_neta_linea']
+            df = pd.read_csv(f"{BASE_URL}maestro_{anio}.csv", dtype=dtypes_optimos, usecols=cols_necesarias)
             dfs.append(df)
-        except Exception as e:
-            st.warning(f"Aviso: No se pudo leer maestro_{anio}.csv. Detalle: {e}")
+        except Exception:
             continue 
-    
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-@st.cache_data(show_spinner="Descargando datos del año en curso...")
+@st.cache_data(show_spinner="Descargando datos 2026...")
 def cargar_actual():
     try:
-        return pd.read_csv(f"{BASE_URL}actual_maestro.csv", low_memory=False)
-    except Exception as e:
-        # AQUÍ ESTÁ EL DETECTOR: Si falla, el error real aparecerá en una caja roja
-        st.error(f"🚨 Error real al leer actual_maestro.csv: {e}")
+        cols_necesarias = ['numero', 'tipo_doc', 'fecha', 'comuna', 'vendedor', 'patente', 'repartidor', 'sku', 'descripcion', 'cant', 'costo_unitario', 'venta_neta_linea']
+        return pd.read_csv(f"{BASE_URL}actual_maestro.csv", dtype=dtypes_optimos, usecols=cols_necesarias)
+    except Exception:
         return pd.DataFrame()
 
 df_hist = cargar_historico()
 df_act = cargar_actual()
 
 if df_act.empty:
-    st.warning("⚠️ La tabla del año actual (2026) está vacía o falló su lectura. Revisa el error rojo de arriba.")
+    st.error("⚠️ No se encontró la tabla del año actual.")
     st.stop()
 
 # ==========================================
 # 2. PROCESAMIENTO Y REGLAS DE NEGOCIO
 # ==========================================
-with st.spinner("🧠 Procesando Reglas de Negocio..."):
+with st.spinner("🧠 Ensamblando datos y limpiando memoria..."):
+    # 1. Unimos la historia con el año actual
     df_final = pd.concat([df_hist, df_act], ignore_index=True)
     
-    # Manejo de fechas
-    df_final['fecha_dt'] = pd.to_datetime(df_final['fecha'], errors='coerce')
+    # 2. TÉCNICA CLAVE: Borramos las tablas originales de la RAM para evitar el colapso
+    del df_hist
+    del df_act
+    gc.collect() 
+    
+    # Manejo de fechas optimizado (le decimos el formato exacto para que no gaste CPU adivinando)
+    df_final['fecha_dt'] = pd.to_datetime(df_final['fecha'], format='%Y-%m-%d', errors='coerce')
     df_final.dropna(subset=['fecha_dt'], inplace=True)
     df_final['año'] = df_final['fecha_dt'].dt.year
     df_final['mes'] = df_final['fecha_dt'].dt.month
     
-    # Conversión segura a números para evitar errores de tipo en operaciones matemáticas
-    cols_num = ['cant', 'costo_unitario', 'venta_neta_linea']
-    for col in cols_num:
-        if col in df_final.columns:
-            df_final[col] = pd.to_numeric(df_final[col], errors='coerce').fillna(0)
-    
-    # Asignación financiera directa desde la tabla original de Sisgen
-    df_final['neto'] = df_final['venta_neta_linea']
-    df_final['costo_total'] = df_final['cant'] * df_final['costo_unitario']
-    
-    # Limpieza estricta de strings
+    # Limpieza del tipo de documento para evitar errores de espacios invisibles
     df_final['tipo_doc'] = df_final['tipo_doc'].astype(str).str.strip().str.upper()
+    
+    # Asignación financiera (Directo de Sisgen)
+    df_final['neto'] = df_final['venta_neta_linea'].fillna(0)
+    df_final['costo_total'] = df_final['cant'].fillna(0) * df_final['costo_unitario'].fillna(0)
     
     # Reglas Tributarias de Sisgen
     CODIGOS_NOTA_CREDITO = ['NE']  
     CODIGOS_VENTA_INTERNA = ['OV'] 
     CODIGOS_COMPRA = ['FC', 'CR']  
     
-    # Excluir documentos que no son ventas reales
+    # Filtro de exclusión
     excluir = CODIGOS_VENTA_INTERNA + CODIGOS_COMPRA
     df_final = df_final[~df_final['tipo_doc'].isin(excluir)]
         
-    # Las Notas de Crédito deben restar (negativo)
+    # Notas de Crédito restan
     mask_nc = df_final['tipo_doc'].isin(CODIGOS_NOTA_CREDITO)
     df_final.loc[mask_nc, 'neto'] = -df_final.loc[mask_nc, 'neto'].abs()
     df_final.loc[mask_nc, 'costo_total'] = -df_final.loc[mask_nc, 'costo_total'].abs()
     
     df_final['margen'] = df_final['neto'] - df_final['costo_total']
     
-    # Blindaje contra nulos y optimización de memoria RAM
-    for col in ['vendedor', 'comuna', 'descripcion', 'patente', 'repartidor']:
-        if col in df_final.columns:
-            df_final[col] = df_final[col].fillna('Sin Registro').astype(str)
-            df_final[col] = df_final[col].astype('category') # Recuperamos RAM aquí
+    # Llenado de nulos
+    cols_texto = ['vendedor', 'comuna', 'descripcion', 'patente', 'repartidor']
+    for col in cols_texto:
+        df_final[col] = df_final[col].fillna('Sin Registro')
 
 # ==========================================
 # 3. INTERFAZ GERENCIAL
@@ -112,7 +124,7 @@ if st.sidebar.button("🔄 Sincronizar Datos Hoy", use_container_width=True):
     with st.spinner("Actualizando 2026 desde el servidor..."):
         try:
             requests.get(f"{BASE_URL}fabrica_datos_real.php?anio=2026", timeout=20)
-            cargar_actual.clear() # Borra la caché para forzar la recarga
+            cargar_actual.clear()
             st.rerun()
         except Exception as e:
             st.sidebar.error(f"Error de red al sincronizar: {e}")
