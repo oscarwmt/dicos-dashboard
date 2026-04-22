@@ -19,24 +19,33 @@ st.markdown("""
 
 BASE_URL = 'https://dicos.cl/appcom/'
 
-# Optimizador de Memoria: Forzamos tipos de datos ligeros
+# Optimizador de Memoria: Categorizamos para no saturar la RAM e incluimos la Logística
 dtypes_optimos = {
     'tipo_doc': 'category',
     'comuna': 'category',
     'vendedor': 'category',
+    'patente': 'category',       # NUEVO CAMPO LOGÍSTICO
+    'repartidor': 'category',    # NUEVO CAMPO LOGÍSTICO
     'cant': 'float32',
     'costo_unitario': 'float32',
     'venta_neta_linea': 'float32'
 }
 
+# ==========================================
+# SISTEMA DE EXTRACCIÓN (Micro-Lotes Anuales)
+# ==========================================
 @st.cache_data(ttl=604800, show_spinner="Abriendo Bóveda Histórica...")
 def cargar_historico():
-    try:
-        df1 = pd.read_csv(f"{BASE_URL}hist_maestro_1.csv", dtype=dtypes_optimos)
-        df2 = pd.read_csv(f"{BASE_URL}hist_maestro_2.csv", dtype=dtypes_optimos)
-        return pd.concat([df1, df2], ignore_index=True)
-    except Exception:
-        return pd.DataFrame()
+    dfs = []
+    # Busca dinámicamente los archivos generados año a año por el PHP
+    for anio in range(2016, 2026): 
+        try:
+            df = pd.read_csv(f"{BASE_URL}maestro_{anio}.csv", dtype=dtypes_optimos)
+            dfs.append(df)
+        except Exception:
+            continue # Si un año no se ha generado en el servidor, simplemente lo salta
+    
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 @st.cache_data(show_spinner="Descargando datos del año en curso...")
 def cargar_actual():
@@ -49,25 +58,29 @@ df_hist = cargar_historico()
 df_act = cargar_actual()
 
 if df_act.empty:
-    st.error("⚠️ No se encontraron los archivos maestros. Ejecuta el PHP primero.")
+    st.error("⚠️ No se encontró el archivo del año en curso. Ejecuta el PHP en tu servidor primero.")
     st.stop()
 
 # ==========================================
 # PROCESAMIENTO ULTRALIGERO
 # ==========================================
-with st.spinner("🧠 Aplicando Reglas de Negocio (Sin cruces pesados)..."):
+with st.spinner("🧠 Aplicando Reglas de Negocio..."):
     df_final = pd.concat([df_hist, df_act], ignore_index=True)
     
+    # Manejo de fechas
     df_final['fecha_dt'] = pd.to_datetime(df_final['fecha'], errors='coerce')
     df_final.dropna(subset=['fecha_dt'], inplace=True)
     df_final['año'] = df_final['fecha_dt'].dt.year
     df_final['mes'] = df_final['fecha_dt'].dt.month
     
+    # Asignación financiera directa desde la tabla original
     df_final['neto'] = df_final['venta_neta_linea']
     df_final['costo_total'] = df_final['cant'] * df_final['costo_unitario']
     
+    # Limpieza estricta de strings
     df_final['tipo_doc'] = df_final['tipo_doc'].astype(str).str.strip().str.upper()
     
+    # Reglas Tributarias
     CODIGOS_NOTA_CREDITO = ['NE']  
     CODIGOS_VENTA_INTERNA = ['OV'] 
     CODIGOS_COMPRA = ['FC', 'CR']  
@@ -81,7 +94,8 @@ with st.spinner("🧠 Aplicando Reglas de Negocio (Sin cruces pesados)..."):
     
     df_final['margen'] = df_final['neto'] - df_final['costo_total']
     
-    for col in ['vendedor', 'comuna', 'descripcion']:
+    # Blindaje contra nulos, incluyendo ahora la patente y el repartidor
+    for col in ['vendedor', 'comuna', 'descripcion', 'patente', 'repartidor']:
         if col in df_final.columns:
             df_final[col] = df_final[col].fillna('Sin Registro').astype(str)
 
@@ -94,7 +108,8 @@ st.sidebar.markdown("### ⚙️ Centro de Datos")
 if st.sidebar.button("🔄 Sincronizar Datos Hoy", use_container_width=True):
     with st.spinner("Actualizando 2026 desde el servidor..."):
         try:
-            requests.get(f"{BASE_URL}fabrica_datos_real.php?bloque=actual", timeout=20)
+            # Enrutamiento actualizado hacia la fábrica por año
+            requests.get(f"{BASE_URL}fabrica_datos_real.php?anio=2026", timeout=20)
             cargar_actual.clear()
             st.rerun()
         except Exception as e:
